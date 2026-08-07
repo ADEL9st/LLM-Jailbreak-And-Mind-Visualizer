@@ -1,22 +1,23 @@
 .field {
   display:grid;
-  gap:7px;
+  gap:6px;
   margin-bottom:12px
 }
 
 .field span,.check-row span {
-  color:#95a3b1;
-  font-size:13px
+  color:var(--text-faint);
+  font-size:12px
 }
 
 .field input,.field select,.field textarea {
   width:100%;
-  min-height:38px;
-  border:1px solid #2e3d4d;
-  background:#0d151d;
-  color:#edf3f7;
-  border-radius:7px;
-  padding:9px 10px;
+  min-height:36px;
+  border:1px solid var(--border);
+  background:var(--bg-rail);
+  color:var(--text);
+  border-radius:8px;
+  padding:8px 10px;
+  font-size:13px;
   outline:none
 }
 
@@ -27,12 +28,12 @@
 }
 
 .field input:focus,.field select:focus,.field textarea:focus {
-  border-color:#2c947d;
-  box-shadow:0 0 0 3px #2c947d29
+  border-color:var(--accent-line);
+  box-shadow:0 0 0 3px var(--accent-soft)
 }
 
 .field small {
-  color:#bac5cf;
+  color:var(--text-dim);
   font-variant-numeric:tabular-nums
 }
 

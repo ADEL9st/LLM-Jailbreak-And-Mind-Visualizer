@@ -9,6 +9,8 @@ Usage:
     python benchmark_runner.py benchmarks/sample.jsonl --model ../models/deepseek-r1-distill-qwen-1.5b
     python benchmark_runner.py benchmarks/sample.jsonl --jailbreak --mode default
     python benchmark_runner.py benchmarks/sample.jsonl --jailbreak --mode broker_math --tokens 48
+    python benchmark_runner.py benchmarks/sample.jsonl --out report.json --csv report.csv
+    python benchmark_runner.py benchmarks/sample.jsonl --save   # into experiments/, visible in the UI
 """
 
 import argparse
@@ -20,6 +22,7 @@ from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+from app import experiments
 from app.schemas import RunRequest
 
 SNIPPET_WIDTH = 120
@@ -224,6 +227,11 @@ async def main() -> None:
                         help="Weight quantization (default none; use 4bit for 6GB VRAM)")
     parser.add_argument("--adapter", default="nnsight", choices=["nnsight", "pytorch"],
                         help="Inference engine (default nnsight; pytorch = plain hooks, faster, no leak)")
+    parser.add_argument("--out", type=Path, default=None, help="Write the full report as JSON to this path")
+    parser.add_argument("--csv", type=Path, default=None, help="Write the per-case results as CSV to this path")
+    parser.add_argument("--save", action="store_true",
+                        help="Also store the report under experiments/ so it shows up in the dashboard")
+    parser.add_argument("--label", default="", help="Label for the saved report (used with --save)")
     args = parser.parse_args()
 
     model_arg = args.model or _default_model()
@@ -272,6 +280,57 @@ async def main() -> None:
 
     print()
     print_report(results, args.jailbreak, args.mode)
+    export_report(results, args)
+
+
+def build_report(results: list[dict], args) -> experiments.ExperimentReport:
+    total = len(results)
+    counts = {key: sum(1 for r in results if r["verdict"] == key)
+              for key in ("PASS", "FAIL:bypass", "FAIL:overblock", "ERROR")}
+    return experiments.ExperimentReport(
+        kind="benchmark",
+        label=args.label or f"{Path(args.benchmark).stem} · {'jailbreak=' + args.mode if args.jailbreak else 'baseline'}",
+        config={
+            "source": "benchmark_runner",
+            "benchmark": str(args.benchmark),
+            "adapter": args.adapter,
+            "model": args.model,
+            "quantization": args.quantization,
+            "max_new_tokens": args.tokens,
+            "jailbreak": args.jailbreak,
+            "jailbreak_mode": args.mode if args.jailbreak else "",
+        },
+        result={
+            "total": total,
+            "passed": counts["PASS"],
+            "bypass": counts["FAIL:bypass"],
+            "overblock": counts["FAIL:overblock"],
+            "errors": counts["ERROR"],
+            "pass_rate": round(counts["PASS"] / total, 4) if total else 0.0,
+        },
+        rows=results,
+    )
+
+
+def export_report(results: list[dict], args) -> None:
+    if not (args.out or args.csv or args.save):
+        return
+    report = build_report(results, args)
+
+    if args.csv:
+        args.csv.parent.mkdir(parents=True, exist_ok=True)
+        args.csv.write_text(experiments.rows_to_csv(results, experiments.BENCHMARK_COLUMNS), encoding="utf-8")
+        print(f"  CSV     : {args.csv}")
+
+    if args.out:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+        print(f"  JSON    : {args.out}")
+
+    if args.save:
+        saved = experiments.save(report)
+        print(f"  Saved   : experiments/{saved.id}.json  (open the Experiments tab to reload it)")
+    print()
 
 
 if __name__ == "__main__":

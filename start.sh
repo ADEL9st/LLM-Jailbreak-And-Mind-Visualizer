@@ -20,27 +20,10 @@ if ! command -v node >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ ! -d "backend/.venv" ]; then
-  echo "Creating backend virtual environment..."
-  python3 -m venv backend/.venv
-fi
+echo "Preparing the runtime for this computer..."
+python3 scripts/bootstrap.py
 
 source backend/.venv/bin/activate
-
-if ! python -c "import fastapi" 2>/dev/null; then
-  echo "Installing backend dependencies..."
-  pip install -r backend/requirements.txt -q
-fi
-
-if ! python -c "import torch" 2>/dev/null; then
-  echo "Installing ML dependencies (this may take a few minutes)..."
-  pip install -r backend/requirements-ml.txt -q
-fi
-
-if ! python -c "import nnsight" 2>/dev/null; then
-  echo "Installing optional nnsight adapter..."
-  pip install -r backend/requirements-nnsight.txt -q || echo "nnsight install failed (optional, pytorch adapter still works)."
-fi
 
 if [ ! -d "frontend/node_modules" ]; then
   echo "Installing frontend dependencies..."

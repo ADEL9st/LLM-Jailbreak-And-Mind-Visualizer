@@ -11,6 +11,9 @@ if errorlevel 1 (
     pause
     exit /b 1
   )
+  set "PYTHON_BOOTSTRAP=python"
+) else (
+  set "PYTHON_BOOTSTRAP=py -3.12"
 )
 
 where node >nul 2>&1
@@ -22,25 +25,12 @@ if errorlevel 1 (
 
 if not exist "models" mkdir models
 
-if not exist "backend\.venv\Scripts\python.exe" (
-  echo Creating backend virtual environment...
-  py -m venv backend\.venv
-)
-
-if not exist "backend\.venv\Lib\site-packages\fastapi" (
-  echo Installing backend dependencies...
-  cd /d "%~dp0backend"
-  .\.venv\Scripts\python -m pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org -r requirements.txt
-  cd /d "%~dp0"
-)
-
-if not exist "backend\.venv\Lib\site-packages\torch" (
-  echo Installing ML dependencies. This may take a few minutes...
-  cd /d "%~dp0backend"
-  .\.venv\Scripts\python -m pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org -r requirements-ml.txt
-  echo Installing optional nnsight adapter...
-  .\.venv\Scripts\python -m pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org -r requirements-nnsight.txt
-  cd /d "%~dp0"
+echo Preparing the runtime for this computer...
+%PYTHON_BOOTSTRAP% scripts\bootstrap.py
+if errorlevel 1 (
+  echo Runtime setup failed. Read the error above and see the How to Use tab for fixes.
+  pause
+  exit /b 1
 )
 
 if not exist "frontend\node_modules" (
@@ -50,7 +40,7 @@ if not exist "frontend\node_modules" (
   cd /d "%~dp0"
 )
 
-start "LLM Mind Visualizer API" cmd /k "cd /d "%~dp0backend" && .\.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000"
+start "LLM Mind Visualizer API" cmd /k "cd /d "%~dp0backend" && .\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000"
 start "LLM Mind Visualizer UI" cmd /k "cd /d "%~dp0frontend" && npm run dev"
 
 timeout /t 4 /nobreak >nul

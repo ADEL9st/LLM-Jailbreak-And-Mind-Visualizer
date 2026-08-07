@@ -1,51 +1,73 @@
 :root {
-  font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;
-  color:#e8edf1;
-  background:#0d1116;
-  font-synthesis:none;
-  text-rendering:optimizeLegibility;
-  -webkit-font-smoothing:antialiased;
-  --text: #e8edf1;
-  --text-muted: #8f9daa;
-  --border: #28384a;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+  color: #e6e9ec;
+  background: #0b0d10;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+
+  /* Flat, low-contrast surfaces. The old build layered translucent
+     glassmorphic panels over a gradient; at this information density that
+     read as noise, so everything is now opaque with a single hairline. */
+  --bg: #0b0d10;
+  --bg-rail: #0e1114;
+  --surface: #14171b;
+  --surface-2: #1c2026;
+  --border: #23282f;
+  --border-soft: #1b1f24;
+  --border-strong: #3a424c;
+
+  --text: #e6e9ec;
+  --text-dim: #a2abb5;
+  --text-faint: #6d7681;
+
   --accent: #6ee7b7;
-  --bg-input: #101820
+  --accent-line: #2f6f5b;
+  --accent-soft: rgba(110, 231, 183, .1);
+
+  /* Legacy aliases still referenced by the panel stylesheets. */
+  --text-muted: var(--text-faint);
+  --bg-input: var(--surface-2);
+  --bg-panel: var(--surface);
+  --bg-hover: var(--surface-2);
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 
 * {
   box-sizing:border-box;
   scrollbar-width:thin;
-  scrollbar-color:#2a3a4d #0d1116
+  scrollbar-color:#2b3138 transparent
 }
 
 *::-webkit-scrollbar {
-  width:10px;
-  height:10px
+  width:9px;
+  height:9px
 }
 
 *::-webkit-scrollbar-track {
-  background:#0d1116
+  background:transparent
 }
 
 *::-webkit-scrollbar-thumb {
-  background:#2a3a4d;
+  background:#2b3138;
   border-radius:6px;
-  border:2px solid #0d1116
+  border:2px solid transparent;
+  background-clip:padding-box
 }
 
 *::-webkit-scrollbar-thumb:hover {
-  background:#3d5066
+  background:#3c444e
 }
 
 *::-webkit-scrollbar-corner {
-  background:#0d1116
+  background:transparent
 }
 
 body {
   margin:0;
   min-width:320px;
   min-height:100vh;
-  background:linear-gradient(180deg,#1a2530d1,#0d1116fa),#0d1116
+  background:var(--bg)
 }
 
 button,input,select,textarea {
@@ -53,12 +75,13 @@ button,input,select,textarea {
 }
 
 button {
-  border:1px solid #334150;
-  background:#17212b;
-  color:#e8edf1;
-  min-height:38px;
-  border-radius:7px;
+  border:1px solid var(--border);
+  background:var(--surface-2);
+  color:var(--text);
+  min-height:34px;
+  border-radius:8px;
   padding:0 12px;
+  font-size:13px;
   display:inline-flex;
   align-items:center;
   justify-content:center;
@@ -67,8 +90,8 @@ button {
 }
 
 button:hover:not(:disabled) {
-  border-color:#4c6175;
-  background:#1d2a36
+  border-color:var(--border-strong);
+  background:#232830
 }
 
 button:disabled {
@@ -77,8 +100,15 @@ button:disabled {
 }
 
 button.primary {
-  background:#1e6f5c;
-  border-color:#2c947d
+  background:var(--accent);
+  border-color:var(--accent);
+  color:#08120e;
+  font-weight:600
+}
+
+button.primary:hover:not(:disabled) {
+  background:#8bf0c8;
+  border-color:#8bf0c8
 }
 
 .conversation {
@@ -510,12 +540,11 @@ button.primary {
   margin-top:10px
 }
 
+/* Retired: the UI is flat now. Kept as a no-op alias so any leftover usage
+   still renders as a normal card. */
 .glassmorphic {
-  background:#0f172a9e!important;
-  backdrop-filter:blur(12px);
-  -webkit-backdrop-filter:blur(12px);
-  border:1px solid rgba(255,255,255,.08)!important;
-  box-shadow:0 4px 30px #00000038;
+  background:var(--surface);
+  border:1px solid var(--border);
   border-radius:12px
 }
 

@@ -13,8 +13,10 @@ __pycache__/
 .venv/
 venv/
 env/
+backend/.venv-py312-broken/
 .pytest_cache/
 *.log
+backend/.pytest-tmp-*/
 backend/ws_dump.jsonl
 backend/src_backup/
 backend/benchmarks/custom*.jsonl
@@ -50,4 +52,14 @@ backend/app/.cache/
 # ── Project Specific ──
 context.md
 app_history.txt
+.claude/
+.codex/
+docs/
 
+# Saved experiment reports — local research output, not source.
+# Delete this line if you want to version a specific experiment set.
+experiments/
+
+# Local model-evaluation reports (keep out of the source repository).
+/gemma4_*.md
+/gemma_*.md

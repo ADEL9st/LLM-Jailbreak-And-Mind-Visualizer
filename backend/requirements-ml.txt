@@ -1,5 +1,13 @@
-torch>=2.3,<2.6
-transformers>=4.45,<4.50
+torch>=2.6,<3
+torchvision>=0.21,<1
+pillow>=10,<13
+# Gemma 4 Unified is registered in the 5.10 generation and requires
+# AutoProcessor + AutoModelForMultimodalLM. Older releases may load only the
+# tokenizer or a fallback model class and then generate invalid text.
+transformers>=5.10,<6
 accelerate>=0.30
 safetensors>=0.4
-bitsandbytes>=0.43; platform_system != "Windows"
+# Windows wheels have shipped since 0.43; the old platform guard silently
+# skipped it on Windows, so 4-bit/8-bit quantization was unavailable there —
+# exactly the machines (laptop GPUs) that need it most.
+bitsandbytes>=0.43

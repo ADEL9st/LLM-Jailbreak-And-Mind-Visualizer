@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 
+from app import experiments, run_control
 from app.adapters.mock import MockAdapter
 from app.adapters.ollama import OllamaAdapter
 from app.adapters.openai_adapter import OpenaiAdapter
 from app.adapters.anthropic_adapter import AnthropicAdapter
 from app.adapters.gemini_adapter import GeminiAdapter
+from app.model_compat import probe_config
 from app.schemas import ModelInfo, RunRequest
 
 
@@ -120,30 +125,68 @@ def _discover_transformers_models() -> list[ModelInfo]:
 
         model_id = f"../models/{folder.name}"
         label = _model_label(folder.name)
+        try:
+            config = json.loads((folder / "config.json").read_text(encoding="utf-8"))
+            model_type = config.get("model_type", "")
+        except (OSError, ValueError, TypeError):
+            config = {}
+            model_type = ""
+        text_config = config.get("text_config") if isinstance(config.get("text_config"), dict) else config
+        architectures = config.get("architectures") if isinstance(config.get("architectures"), list) else []
+        profile = {
+            "model_type": str(model_type),
+            "architecture": str(architectures[0]) if architectures else "",
+            "layer_count": _config_int(text_config, "num_hidden_layers"),
+            "hidden_size": _config_int(text_config, "hidden_size"),
+            "attention_heads": _config_int(text_config, "num_attention_heads"),
+            "context_length": _config_int(text_config, "max_position_embeddings"),
+            "dtype": str(text_config.get("torch_dtype") or config.get("torch_dtype") or ""),
+            "size_bytes": sum(path.stat().st_size for path in folder.glob("*.safetensors")),
+        }
+        compatibility = probe_config(config)
+        is_native_multimodal = compatibility.native_processor
+        capabilities = ["white_box", *compatibility.capabilities]
         if "pytorch" in adapters:
             models_found.append(
                 ModelInfo(
                     id=model_id,
                     label=f"{label} (pytorch)",
                     adapter="pytorch",
-                    description="White-box via plain PyTorch hooks — faster, no hook leak, natural EOS.",
+                    capabilities=capabilities,
+                    compatibility=compatibility.as_dict(),
+                    **profile,
+                    description=(
+                        "Native multimodal processor + PyTorch hooks — complete model inputs."
+                        if is_native_multimodal
+                        else "White-box via plain PyTorch hooks — faster, no hook leak, natural EOS."
+                    ),
                 )
             )
-        if "nnsight" in adapters:
+        # Native multimodal models need AutoProcessor and auxiliary model inputs.
+        # The legacy string-only adapters silently discard those inputs and can
+        # produce plausible-looking but invalid token streams, so do not offer
+        # them for this architecture.
+        if not is_native_multimodal and "nnsight" in adapters:
             models_found.append(
                 ModelInfo(
                     id=model_id,
                     label=f"{label} (nnsight)",
                     adapter="nnsight",
+                    capabilities=["white_box", "text", "nnsight"],
+                    compatibility=compatibility.as_dict(),
+                    **profile,
                     description="White-box via nnsight tracing — layer + head/neuron interventions.",
                 )
             )
-        if "transformers" in adapters:
+        if not is_native_multimodal and "transformers" in adapters:
             models_found.append(
                 ModelInfo(
                     id=model_id,
                     label=f"{label} (hook v1)",
                     adapter="transformers",
+                    capabilities=["white_box", "text", "legacy"],
+                    compatibility=compatibility.as_dict(),
+                    **profile,
                     description="Legacy white-box via manual forward hooks.",
                 )
             )
@@ -152,6 +195,11 @@ def _discover_transformers_models() -> list[ModelInfo]:
 
 def _model_label(folder_name: str) -> str:
     return folder_name.replace("-", " ").replace("_", " ").title()
+
+
+def _config_int(config: dict, key: str) -> int | None:
+    value = config.get(key)
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
 from app.prompt_craft import apply_prompt_craft
@@ -169,14 +217,133 @@ async def unload_models() -> dict:
     return {"released": released}
 
 
+@app.get("/experiments")
+async def list_experiments() -> list[experiments.ExperimentSummary]:
+    return experiments.list_summaries()
+
+
+@app.post("/experiments")
+async def create_experiment(report: experiments.ExperimentReport) -> experiments.ExperimentReport:
+    return experiments.save(report)
+
+
+@app.get("/experiments/{experiment_id}")
+async def get_experiment(experiment_id: str) -> experiments.ExperimentReport:
+    try:
+        report = experiments.load(experiment_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if report is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    return report
+
+
+@app.patch("/experiments/{experiment_id}/review")
+async def review_experiment(
+    experiment_id: str,
+    update: experiments.ExperimentReviewUpdate,
+) -> experiments.ExperimentReport:
+    try:
+        report = experiments.update_review(experiment_id, update)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if report is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    return report
+
+
+@app.get("/experiments/{experiment_id}/csv", response_class=PlainTextResponse)
+async def get_experiment_csv(experiment_id: str) -> PlainTextResponse:
+    try:
+        report = experiments.load(experiment_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if report is None:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    if not report.rows:
+        raise HTTPException(status_code=400, detail="this experiment has no tabular rows")
+    body = experiments.rows_to_csv(report.rows, experiments.columns_for(report.kind))
+    return PlainTextResponse(
+        body,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{report.id}.csv"'},
+    )
+
+
+@app.delete("/experiments/{experiment_id}")
+async def remove_experiment(experiment_id: str) -> dict:
+    try:
+        removed = experiments.delete(experiment_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not removed:
+        raise HTTPException(status_code=404, detail="experiment not found")
+    return {"deleted": experiment_id}
+
+
+BUSY_MESSAGE = (
+    "Another run is already in progress on this server. Wait for it to finish or stop it, "
+    "then try again."
+)
+
+# Adapters are module-level singletons that register hooks on one shared model
+# instance, so two concurrent runs would clobber each other's hooks and
+# interleave telemetry into both sockets. The UI's `busy` flag only guards a
+# single tab; this guards a second tab, the benchmark CLI, or any other client.
+_run_lock = asyncio.Lock()
+
+
 @app.websocket("/ws/run")
 async def run_socket(websocket: WebSocket) -> None:
     await websocket.accept()
-    stream_iter = None
     try:
         payload = await websocket.receive_text()
         request = RunRequest.model_validate_json(payload)
 
+        # Reject rather than queue: a queued client would sit silent behind a
+        # long generation with no way to tell that from a hang.
+        if _run_lock.locked():
+            await websocket.send_text(json.dumps({"type": "error", "ts": 0, "data": {"message": BUSY_MESSAGE}}))
+            return
+
+        # No await between the check above and the acquire below, so on the
+        # single event loop this cannot race.
+        async with _run_lock:
+            await _stream_run(websocket, request)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:  # noqa: BLE001
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "ts": 0, "data": {"message": str(exc)}}))
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+async def _stream_run(websocket: WebSocket, request: RunRequest) -> None:
+    stream_iter = None
+    cancel_event = threading.Event()
+
+    async def watch_for_stop() -> None:
+        try:
+            while True:
+                message = await websocket.receive_text()
+                try:
+                    payload = json.loads(message)
+                except (TypeError, ValueError):
+                    payload = {}
+                if isinstance(payload, dict) and payload.get("type") == "stop":
+                    cancel_event.set()
+                    return
+        except WebSocketDisconnect:
+            cancel_event.set()
+
+    stop_watcher = asyncio.create_task(watch_for_stop())
+    try:
         if request.prompt_craft != "none":
             crafted = apply_prompt_craft(request.prompt, request.prompt_craft)
             request.prompt = crafted
@@ -188,27 +355,25 @@ async def run_socket(websocket: WebSocket) -> None:
             }))
 
         adapter = adapters[request.adapter]
-        stream_iter = adapter.stream(request).__aiter__()
-        while True:
-            try:
-                item = await stream_iter.__anext__()
-            except StopAsyncIteration:
-                break
-            await websocket.send_text(json.dumps(item))
-    except WebSocketDisconnect:
-        pass
-    except Exception as exc:  # noqa: BLE001
-        try:
-            await websocket.send_text(json.dumps({"type": "error", "ts": 0, "data": {"message": str(exc)}}))
-        except Exception:
-            pass
+        with run_control.use(cancel_event):
+            stream_iter = adapter.stream(request).__aiter__()
+            while True:
+                try:
+                    item = await stream_iter.__anext__()
+                except StopAsyncIteration:
+                    break
+                await websocket.send_text(json.dumps(item))
     finally:
+        cancel_event.set()
+        stop_watcher.cancel()
+        try:
+            await stop_watcher
+        except (asyncio.CancelledError, WebSocketDisconnect):
+            pass
+        # Always close the generator so the adapter's `finally` runs and its
+        # forward hooks come off the model, even on disconnect mid-generation.
         if stream_iter is not None:
             try:
                 await stream_iter.aclose()
             except Exception:
                 pass
-        try:
-            await websocket.close()
-        except Exception:
-            pass

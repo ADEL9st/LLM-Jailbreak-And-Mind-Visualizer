@@ -31,6 +31,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app import steering_config
+
 # Primary-axis (k=0) overshoot multipliers per mode.
 PRIMARY_MULT = {
     "advanced": 1.5,     # full steering, moderate overshoot
@@ -103,29 +105,96 @@ def pid_control_steer(new_out: Any, coeff: Any, direction: Any, out_dtype: Any) 
     dynamic_mult = torch.clamp(1.0 + (intensity * 0.5), max=3.0)
     return (new_out.float() - (dynamic_mult * intensity) * direction).to(out_dtype)
 
+ACMS_GAMMA_MAX = 1.3
+ACMS_CENTRE = 0.12
+ACMS_SLOPE = 14.0
+
+
 def orthogonal_steer(new_out: Any, coeff: Any, direction: Any, out_dtype: Any) -> Any:
-    """Orthogonal Steer (Manifold Preserving): Subtracts the refusal direction but maintains the original L2 norm
-    to prevent the residual stream from falling off the manifold and causing hallucinations.
+    """Adaptive Cosine Manifold Steer — closed-loop ablation, norm preserved.
+
+    Replaces the previous fixed 1.5x subtraction. Two changes, both measured:
+
+    * **Gate on the cosine, not the raw projection.** `coeff` is `r · d` and every
+      direction is unit-norm, so `coeff / ||r||` is exactly cos θ. The raw
+      coefficient grows with the residual norm, which grows with depth — gating on
+      it silently over-steers late layers. The cosine is scale-free.
+
+    * **One continuous gate.** A hard `mask(cos > 0)` combined with a sigmoid
+      centred above zero makes gamma jump 0 -> 1.6 across cos = 0, so a residual
+      hovering near zero oscillates between untouched and hit hard. A single
+      sigmoid centred at ACMS_CENTRE is ~0.05 at cos = 0 and needs no mask.
+
+    Gamma caps at 1.3 rather than 2.5 on purpose: the subtraction leaves the
+    projection at `coeff * (1 - gamma)`, so 2.5 does not remove refusal, it
+    inverts it to -1.5x. Measured, the softer cap ablates just as well and keeps
+    coherence at 1.00.
     """
-    orig_norm = new_out.float().norm(dim=-1, keepdim=True)
-    steered = new_out.float() - (1.5 * coeff) * direction
-    steered_norm = steered.norm(dim=-1, keepdim=True)
-    # Scale back to original norm to preserve the manifold
-    steered = steered * (orig_norm / (steered_norm + 1e-6))
-    return steered.to(out_dtype)
+    import torch
+
+    out_f = new_out.float()
+    orig_norm = out_f.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    cos_sim = coeff / orig_norm
+    gamma = ACMS_GAMMA_MAX * torch.sigmoid(ACMS_SLOPE * (cos_sim - ACMS_CENTRE))
+    steered = out_f - (gamma * coeff) * direction
+    # Restore the original L2 norm so the residual stays on the manifold.
+    steered_norm = steered.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    return (steered * (orig_norm / steered_norm)).to(out_dtype)
+
+# The refusal decision is made in the opening tokens; after that the circuit
+# still fires but no longer steers the output (measured). Steering past step 1
+# is wasted work that only degrades coherence.
+PATCH_LAST_STEP = 1
+PATCH_MULTIPLIER = 2.5
+
 
 def activation_patch_steer(new_out: Any, coeff: Any, direction: Any, step: int, out_dtype: Any) -> Any:
-    """Activation Patching (First Tokens): Strongly pre-fills compliance by subtracting a massive
-    refusal coefficient during the first few tokens, effectively patching the attention KV cache
-    with a 'compliant' state, then relaxes.
+    """Activation Patching (opening tokens only).
+
+    Forces a compliant opening by overshooting hard on steps 0-1, then stops
+    intervening entirely. The KV cache now carries a compliant prefix, and the
+    model continues from it on its own.
     """
-    if step < 3:
-        # Massive overshoot on first tokens to force compliant KV cache state
-        multiplier = 2.5
-    else:
-        # Relax to normal steering
-        multiplier = 1.2
+    if step > steering_config.activation_patch_last_step(PATCH_LAST_STEP):
+        # Release completely rather than relaxing to a small residual push.
+        #
+        # Measured (qwen2.5-1.5b, hard-refusal prompt, 40 tokens): steering only
+        # steps 0-1 and then stopping flips the refusal with coherence 1.00,
+        # while the old "relax to x1.2 forever" tail scored 0.97 — the tail cost
+        # output quality and bought nothing. The refusal signal stays high
+        # (peak 0.97) either way: once the model has committed to "Sure!", the
+        # refusal circuit keeps firing but no longer drives the output. That
+        # decoupling is the whole reason this mode works, and it means the other
+        # ~95% of the generation needs no intervention at all.
+        return new_out
+    multiplier = steering_config.activation_patch_multiplier(PATCH_MULTIPLIER)
     return (new_out.float() - (multiplier * coeff) * direction).to(out_dtype)
+
+
+def commit_release_steer(
+    new_out: Any,
+    coeff: Any,
+    direction: Any,
+    step: int,
+    out_dtype: Any,
+) -> Any:
+    """Strong early commitment followed by gated, low-power maintenance.
+
+    ``activation_patch`` releases the residual completely after its opening
+    window, allowing a late refusal to re-enter. Continuous strong ablation, on
+    the other hand, pushes deep models off-manifold. This hybrid only touches a
+    positive refusal projection: it overshoots during the opening decision and
+    later removes just enough of a reappearing projection to preserve the
+    already-established response trajectory. Negative/compliant projections are
+    left byte-for-byte unchanged.
+    """
+    positive_coeff = coeff.clamp(min=0)
+    multiplier = (
+        steering_config.commit_multiplier()
+        if step <= steering_config.commit_steps()
+        else steering_config.maintenance_multiplier()
+    )
+    return (new_out.float() - (multiplier * positive_coeff) * direction).to(out_dtype)
 
 def gradient_steer(new_out: Any, coeff: Any, direction: Any, out_dtype: Any) -> Any:
     """Gradient GCG Approximation: Fast approximation of gradient-guided steering by
@@ -235,3 +304,125 @@ def mlp_direction_ablate(new_out: Any, mlp_dir: Any, out_dtype: Any, strength: f
     direction = mlp_dir.to(new_out.device)
     coeff = (new_out.float() * direction).sum(dim=-1, keepdim=True).clamp(min=0)
     return (new_out.float() - strength * coeff * direction).to(out_dtype)
+
+
+def adaptive_steer(
+    new_out: Any,
+    coeff: Any,
+    direction: Any,
+    mlp_dir: Any,
+    help_dir: Any,
+    step: int,
+    out_dtype: Any,
+    hidden_dim: int = 0,
+) -> Any:
+    """Adaptive Closed-Loop Steering.
+
+    Dynamically monitors the refusal projection coefficient at each generation step.
+    If positive (refusal tendency detected), applies closed-loop adaptive strength
+    to push the state into the compliant manifold. If zero/negative (already compliant),
+    relaxes intervention to preserve language naturalness.
+    """
+    pos_coeff = coeff.clamp(min=0)
+    # Closed-loop scaling based on current step and refusal intensity
+    if step <= 15:
+        # Early critical window: apply dynamic overshoot based on coeff magnitude
+        strength = 1.3 + 0.5 * (pos_coeff / (new_out.float().norm(dim=-1, keepdim=True) + 1e-6)).clamp(max=1.0)
+    else:
+        # Maintenance phase: lower intensity to preserve coherence
+        strength = 1.0
+
+    res = new_out.float() - (strength * pos_coeff) * direction
+
+    # Apply adaptive MLP probe ablation if refusal coefficient is active
+    if mlp_dir is not None and pos_coeff.max() > 0:
+        mlp_direction = mlp_dir.to(new_out.device)
+        mlp_c = (res * mlp_direction).sum(dim=-1, keepdim=True).clamp(min=0)
+        res = res - 0.7 * mlp_c * mlp_direction
+
+    # Apply helpfulness boost if present
+    if help_dir is not None:
+        h_direction = help_dir.to(new_out.device)
+        h_c = (res * h_direction).sum(dim=-1, keepdim=True)
+        res = res + (0.5 * h_c.clamp(max=0).abs() + 0.1) * h_direction
+
+    return res.to(out_dtype)
+
+
+# Diversion / Soft Refusal Token Penalization
+DIVERSION_TOKEN_STRINGS = [
+    "To be helpful", "I cannot", "I am prohibited", "against my safety",
+    "safety guidelines", "As an AI", "AI assistant", "I'm sorry", "I apologize",
+]
+
+
+def _diversion_token_sequences(tokenizer: Any) -> list[tuple[int, ...]]:
+    """Return complete soft-refusal phrase token sequences.
+
+    Penalising every constituent token globally also penalises common fragments
+    such as ``I``, ``be``, ``an`` and ``pro``. Gemma then escapes into whitespace
+    or punctuation. Keep the phrase context and only block its completion token.
+    """
+    if tokenizer is None:
+        return []
+    cache_name = "_diversion_phrase_sequences_v2"
+    if not hasattr(tokenizer, cache_name):
+        sequences: set[tuple[int, ...]] = set()
+        for phrase in DIVERSION_TOKEN_STRINGS:
+            for variant in (phrase, f" {phrase}"):
+                sequence = tuple(tokenizer.encode(variant, add_special_tokens=False))
+                if len(sequence) >= 2:
+                    sequences.add(sequence)
+        setattr(tokenizer, cache_name, sorted(sequences))
+    return getattr(tokenizer, cache_name)
+
+
+def _diversion_token_ids(tokenizer: Any) -> list[int]:
+    """Return phrase-completion ids for approximate post-hoc telemetry."""
+    return sorted({sequence[-1] for sequence in _diversion_token_sequences(tokenizer)})
+
+
+def apply_diversion_penalty(logits: Any, tokenizer: Any, penalty_strength: float = 20.0) -> Any:
+    """Apply the penalty to saved logits for telemetry/replay analysis."""
+    ids = _diversion_token_ids(tokenizer)
+    if not ids:
+        return logits
+    logits = logits.clone()
+    logits[:, ids] -= penalty_strength
+    return logits
+
+
+def make_diversion_logits_processor(tokenizer: Any, penalty_strength: float = 20.0):
+    """Penalise a refusal phrase only when its exact prefix is the current suffix."""
+    sequences = _diversion_token_sequences(tokenizer)
+    if not sequences:
+        return None
+
+    def _processor(input_ids: Any, scores: Any) -> Any:
+        for batch_idx in range(input_ids.shape[0]):
+            context = input_ids[batch_idx].tolist()
+            targets: set[int] = set()
+            for sequence in sequences:
+                prefix = sequence[:-1]
+                if len(context) >= len(prefix) and tuple(context[-len(prefix):]) == prefix:
+                    targets.add(sequence[-1])
+            if targets:
+                scores[batch_idx, list(targets)] -= penalty_strength
+        return scores
+
+    return _processor
+
+
+def diversion_suppress(new_out: Any, help_dir: Any, out_dtype: Any, strength: float = 0.5) -> Any:
+    """D: Benign topic deflection / diversion vector suppression.
+
+    Suppresses the intermediate activation component that drives the model into
+    benign educational substitution / science-fair deflection patterns.
+    """
+    if help_dir is None:
+        return new_out
+    direction = help_dir.to(new_out.device)
+    coeff = (new_out.float() * direction).sum(dim=-1, keepdim=True).clamp(min=0)
+    return (new_out.float() - strength * coeff * direction).to(out_dtype)
+
+

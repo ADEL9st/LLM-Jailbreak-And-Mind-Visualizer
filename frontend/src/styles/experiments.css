@@ -1,0 +1,152 @@
+/* Saved-experiment browser — reuses .bench-header / .bench-actions from
+   benchmark.css so the three batch tabs share one visual language. */
+
+.experiments-panel {
+  display:flex;
+  flex-direction:column;
+  gap:.85rem;
+  padding:1rem;
+  overflow-y:auto;
+  flex:1
+}
+
+.experiment-list {
+  display:flex;
+  flex-direction:column;
+  gap:.55rem
+}
+
+.experiment-card {
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+  gap:1rem;
+  flex-wrap:wrap;
+  padding:.7rem .85rem;
+  border:1px solid var(--border);
+  border-left:3px solid var(--border);
+  border-radius:8px;
+  background:var(--bg-panel, var(--surface))
+}
+
+.experiment-card.kind-run { border-left-color:var(--accent) }
+.experiment-card.kind-benchmark { border-left-color:#60a5fa }
+.experiment-card.kind-compare { border-left-color:#c084fc }
+
+.experiment-card-main {
+  display:flex;
+  flex-direction:column;
+  gap:.3rem;
+  min-width:0;
+  flex:1
+}
+
+.experiment-card-head {
+  display:flex;
+  align-items:center;
+  gap:.5rem;
+  min-width:0
+}
+
+.experiment-kind {
+  font-size:.65rem;
+  text-transform:uppercase;
+  letter-spacing:.05em;
+  padding:.12rem .4rem;
+  border-radius:4px;
+  border:1px solid var(--border);
+  color:var(--text-muted);
+  flex-shrink:0
+}
+
+.experiment-kind.run { color:var(--accent) }
+.experiment-kind.benchmark { color:#60a5fa }
+.experiment-kind.compare { color:#c084fc }
+
+.experiment-label {
+  font-size:.85rem;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis
+}
+
+.experiment-meta {
+  display:flex;
+  gap:.6rem;
+  flex-wrap:wrap;
+  font-size:.72rem;
+  color:var(--text-muted)
+}
+
+.experiment-model {
+  font-family:var(--font-mono, monospace)
+}
+
+.experiment-flag {
+  padding:.05rem .35rem;
+  border-radius:4px;
+  font-weight:600
+}
+
+.experiment-flag.jb { color:#fbbf24 }
+.experiment-flag.refused { color:#f87171 }
+.experiment-flag.complied { color:#4ade80 }
+.experiment-flag.not-refused { color:var(--text-muted) }
+
+.review-picker {
+  display:inline-flex;
+  align-items:center;
+  gap:.3rem;
+}
+
+.review-picker select,
+.review-picker input {
+  min-width:7.5rem;
+  padding:.12rem .35rem;
+  border:1px solid var(--border);
+  border-radius:5px;
+  background:var(--surface);
+  color:var(--text);
+  font-size:.7rem;
+}
+
+.review-picker input {
+  min-width:10rem;
+}
+
+.review-picker button {
+  padding:.16rem .45rem;
+  font-size:.68rem;
+}
+
+.experiment-card-actions {
+  display:flex;
+  gap:.4rem;
+  align-items:center;
+  flex-shrink:0
+}
+
+.experiment-card-actions button,
+.experiment-csv-link {
+  display:inline-flex;
+  align-items:center;
+  gap:.3rem;
+  font-size:.75rem;
+  padding:.3rem .55rem;
+  border-radius:6px;
+  border:1px solid var(--border);
+  background:transparent;
+  color:var(--text);
+  text-decoration:none;
+  cursor:pointer
+}
+
+.experiment-card-actions button:hover,
+.experiment-csv-link:hover {
+  background:var(--bg-hover, rgba(255,255,255,.05))
+}
+
+.experiment-card-actions button.danger {
+  color:#f87171;
+  border-color:#f87171
+}

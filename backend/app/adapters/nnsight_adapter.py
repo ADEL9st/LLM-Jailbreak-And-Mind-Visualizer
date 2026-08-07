@@ -25,17 +25,18 @@ the direction is model-intrinsic, so there is no reason to re-derive it.
 
 from __future__ import annotations
 
+import asyncio
 import math
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 import re
 
-from app import refusal
+from app import refusal, run_control, steering_config, token_budget
 from app.adapters.base import ModelAdapter, event, hallucination_from_entropy
 from app.adapters.shared import (
-    STEER_MIN_WEIGHT,
     jailbreak_advanced,
+    head_dims_per_layer as _head_dims_per_layer,
     head_mutes as _head_mutes,
     intervention_payload as _intervention_payload,
     layer_factor as _layer_factor,
@@ -43,6 +44,7 @@ from app.adapters.shared import (
     raw_activities as _raw_activities,
     release_memory,
     safety_trace_payload as _safety_trace_payload,
+    steer_plan as _steer_plan,
     trim_at_eos as _trim_at_eos,
 )
 from app.analysis.think_phase import ThinkPhaseTracker
@@ -64,7 +66,8 @@ class NnsightAdapter(ModelAdapter):
         self._final_norm: Any = None
         self._lm_head_module: Any = None
         self._n_heads: int = 0
-        self._head_dim: int = 0
+        self._hidden_size: int = 0
+        self._head_dims: list[int] = []
         self._lm_head_weight: Any = None  # plain tensor, bypasses nnsight hooks
         self._embed_tokens_envoy: Any = None  # envoy, varies for multimodal models
         self._refusal: Any = None
@@ -87,8 +90,9 @@ class NnsightAdapter(ModelAdapter):
 
         torch = self._torch
         try:
-            async for ev in self._stream_body(request, model_id):
-                yield ev
+            with steering_config.use(getattr(request, "steering", None)):
+                async for ev in self._stream_body(request, model_id):
+                    yield ev
         finally:
             self._purge_nnsight_hooks()
             release_memory(torch)
@@ -103,11 +107,34 @@ class NnsightAdapter(ModelAdapter):
         interventions = request.active_interventions()
 
         history_turns = [(turn.role, turn.content) for turn in request.history]
-        prompt_text = self._format_prompt(request.prompt, request.response_language, history_turns)
+        prompt_text = self._format_prompt(
+            request.prompt,
+            request.response_language,
+            history_turns,
+            system_prompt=request.system_prompt,
+            assistant_prefill=request.assistant_prefill,
+        )
         enc = tokenizer(prompt_text, return_tensors="pt")
         prompt_token_ids = enc["input_ids"][0].tolist()
         prompt_token_count = len(prompt_token_ids)
         prompt_tokens_decoded, prompt_token_positions = self._real_prompt_tokens(prompt_token_ids)
+        context_length = token_budget.model_context_length(lm, tokenizer)
+        hardware_limit = token_budget.instrumented_hardware_limit(getattr(lm, "_model", lm), torch, prompt_token_count)
+        effective_max_tokens = token_budget.effective_output_tokens(
+            request.max_new_tokens,
+            request.token_limit_mode,
+            prompt_token_count,
+            context_length,
+            hardware_limit=hardware_limit,
+        )
+        resolved_budget = token_budget.budget_payload(
+            requested=request.max_new_tokens,
+            effective=effective_max_tokens,
+            mode=request.token_limit_mode,
+            context_length=context_length,
+            prompt_tokens=prompt_token_count,
+            hardware_safe_max_tokens=hardware_limit,
+        )
 
         yield event(
             "run_started",
@@ -116,7 +143,7 @@ class NnsightAdapter(ModelAdapter):
                 "model": model_id,
                 "layer_count": n_layers,
                 "head_count": getattr(getattr(lm, "config", None), "num_attention_heads", None),
-                "prompt_tokens": prompt_token_count,
+                **resolved_budget,
                 "output_policy": request.output_policy,
                 "quantization": quantization,
             },
@@ -172,18 +199,31 @@ class NnsightAdapter(ModelAdapter):
 
         # --- generation kwargs & base interventions ---
         do_sample = request.temperature > 0
-        gen_kwargs: dict[str, Any] = {"max_new_tokens": request.max_new_tokens, "do_sample": do_sample}
+        gen_kwargs: dict[str, Any] = {"max_new_tokens": effective_max_tokens, "do_sample": do_sample}
         if do_sample:
             gen_kwargs["temperature"] = request.temperature
+        cancel_criteria = run_control.stopping_criteria()
+        if cancel_criteria is not None:
+            gen_kwargs["stopping_criteria"] = cancel_criteria
 
         layer_factors = {idx: _layer_factor(interventions, idx) for idx in range(n_layers)}
         head_mutes = _head_mutes(interventions, n_layers)
         steer_weights = list(refusal_dirs.effective_weight) if jailbreak else [0.0] * n_layers
+        steer_weights = steering_config.apply_layer_targets(steer_weights)
         jailbreak_mode = getattr(request, "jailbreak_mode", "default")
         use_mlp = bool(getattr(request, "use_mlp_ablation", True))
         use_help = bool(getattr(request, "use_helpfulness_boost", True))
         use_norm = bool(getattr(request, "use_norm_regulation", True))
-        _hidden_dim = self._head_dim * self._n_heads
+        use_div = bool(getattr(request, "use_diversion_suppression", True))
+        if jailbreak and use_div and jailbreak_advanced is not None:
+            penalty = steering_config.diversion_penalty()
+            if penalty > 0:
+                processor = jailbreak_advanced.make_diversion_logits_processor(
+                    tokenizer, penalty_strength=penalty
+                )
+                if processor is not None:
+                    gen_kwargs["logits_processor"] = [processor]
+        _hidden_dim = self._hidden_size
 
         # Calibration-quality warnings for small / weakly-tuned models
         if refusal_dirs is not None and jailbreak:
@@ -226,7 +266,7 @@ class NnsightAdapter(ModelAdapter):
 
         # --- run generator and collect step telemetry ---
         try:
-            layer_steps, embed_steps, logits_steps, full_ids = self._run_generation(
+            layer_steps, embed_steps, logits_steps, full_ids = await asyncio.to_thread(self._run_generation,
                 lm=lm,
                 prompt_text=prompt_text,
                 gen_kwargs=gen_kwargs,
@@ -239,6 +279,7 @@ class NnsightAdapter(ModelAdapter):
                 use_mlp=use_mlp,
                 use_help=use_help,
                 use_norm=use_norm,
+                use_div=use_div,
                 refusal_dirs=refusal_dirs,
             )
         except Exception as exc:  # noqa: BLE001
@@ -251,7 +292,7 @@ class NnsightAdapter(ModelAdapter):
         generated_ids = _trim_at_eos(full_ids[prompt_token_count:], tokenizer)
         n_steps = min(len(generated_ids), len(logits_steps))
         activity_accumulator = [0.0 for _ in range(n_layers)]
-        generated = ""
+        generated = request.assistant_prefill or ""
         think_tracker = ThinkPhaseTracker()
 
         for step in range(n_steps):
@@ -333,7 +374,23 @@ class NnsightAdapter(ModelAdapter):
         # correct), not the per-step accumulation — which can be short when the
         # model hits EOS before max_new_tokens (nnsight's .all() collection then
         # stops early). This keeps the answer/refusal flag right regardless.
-        final_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+        final_text = (request.assistant_prefill or "") + tokenizer.decode(generated_ids, skip_special_tokens=True)
+        # Classify before redaction: the redacted form is all block characters
+        # and would score as degenerate whatever the model actually said.
+        outcome = refusal.classify_output(final_text)
+        coherence = refusal.coherence_report(final_text)
+        finish_reason = (
+            "cancelled" if run_control.cancelled()
+            else "length" if len(generated_ids) >= effective_max_tokens
+            else "stop"
+        )
+        assessment = refusal.assess_output(
+            final_text,
+            request.response_language,
+            finish_reason=finish_reason,
+            output_tokens=len(generated_ids),
+            max_new_tokens=effective_max_tokens,
+        )
         # Apply the same output-policy redaction the per-token stream did, so
         # any downstream consumer of run_completed (chat memory, logs) sees the
         # same content the user did — raw final_text would leak past redaction.
@@ -343,11 +400,21 @@ class NnsightAdapter(ModelAdapter):
             "run_completed",
             {
                 "generated_text": final_text,
-                "finish_reason": "length" if len(generated_ids) >= request.max_new_tokens else "stop",
+                "finish_reason": finish_reason,
                 "output_tokens": len(generated_ids),
-                "refused": refusal.detect_refusal(final_text),
+                **resolved_budget,
+                "refused": outcome == "refusal",
+                # `refused == False` alone does NOT mean the steering worked —
+                # incoherent output also contains no refusal phrase. Only
+                # outcome == "compliance" is a real bypass.
+                "outcome": outcome,
+                "coherent": coherence["coherent"],
+                "coherence": coherence,
+                "assessment": assessment,
                 "jailbreak": jailbreak,
                 "best_layer": refusal_dirs.best_layer if refusal_dirs is not None else None,
+                "calibration_quality": refusal_dirs.calibration_quality if refusal_dirs is not None else None,
+                "steering_config": steering_config.describe(),
             },
         )
 
@@ -369,6 +436,7 @@ class NnsightAdapter(ModelAdapter):
         use_mlp: bool = True,
         use_help: bool = True,
         use_norm: bool = True,
+        use_div: bool = True,
         refusal_dirs: Any = None,
     ) -> tuple[list[list[Any]], list[Any], list[Any], list[int]]:
         """Generate, collecting per-step *post-intervention* residuals.
@@ -412,8 +480,11 @@ class NnsightAdapter(ModelAdapter):
         if jailbreak_mode == "surgical" and jailbreak_advanced is not None:
             surgical_layers = jailbreak_advanced.surgical_top_layers(steer_weights)
 
-        head_dim = self._head_dim
-        _hidden_dim = self._head_dim * self._n_heads
+        head_dims = self._head_dims
+        _hidden_dim = self._hidden_size
+        # Which layers to steer, and how hard — capped and weight-scaled rather
+        # than "every layer above the threshold, all at full strength".
+        steer_scales = _steer_plan(steer_weights)
         result = None
         with lm.generate(prompt_text, **gen_kwargs) as tracer:
             with tracer.all():
@@ -421,7 +492,8 @@ class NnsightAdapter(ModelAdapter):
                 embed_steps.append(embed_out[0, -1, :].save())
                 prev_out = embed_out  # residual entering layer 0
                 for idx, layer in enumerate(layers):
-                    for head in head_mutes.get(idx, ()):  # type: ignore[arg-type]
+                    head_dim = head_dims[idx] if idx < len(head_dims) else 0
+                    for head in head_mutes.get(idx, ()) if head_dim else ():  # type: ignore[arg-type]
                         sl = slice(head * head_dim, (head + 1) * head_dim)
                         if jailbreak_mode == "broker_half" and jailbreak_advanced is not None:
                             layer.self_attn.o_proj.input[:, :, sl] = (
@@ -434,11 +506,15 @@ class NnsightAdapter(ModelAdapter):
                     new_out = out
                     if abs(factor - 1.0) > 1e-6:
                         new_out = prev_out + (new_out - prev_out) * factor
+                    _surgical = jailbreak_mode == "surgical" and jailbreak_advanced is not None
                     _steer_this = jailbreak and subspace is not None and (
-                        (jailbreak_mode == "surgical" and jailbreak_advanced is not None and idx in surgical_layers)
-                        or (jailbreak_mode != "surgical" and steer_weights[idx] >= STEER_MIN_WEIGHT)
+                        (_surgical and idx in surgical_layers)
+                        or (not _surgical and idx in steer_scales)
                     )
                     if _steer_this:
+                        # `surgical` picks its own (already capped) layer set,
+                        # so it keeps full strength on each of them.
+                        layer_scale = 1.0 if _surgical else steer_scales[idx]
                         original_out = new_out
                         current_step = len(layer_steps[idx])
                         layer_subspace = subspace[idx]
@@ -472,6 +548,8 @@ class NnsightAdapter(ModelAdapter):
                                     new_out = jailbreak_advanced.orthogonal_steer(new_out, coeff, direction, out.dtype)
                                 elif jailbreak_mode == "activation_patch" and jailbreak_advanced is not None:
                                     new_out = jailbreak_advanced.activation_patch_steer(new_out, coeff, direction, current_step, out.dtype)
+                                elif jailbreak_mode == "commit_release" and jailbreak_advanced is not None:
+                                    new_out = jailbreak_advanced.commit_release_steer(new_out, coeff, direction, current_step, out.dtype)
                                 elif jailbreak_mode == "gradient_steer" and jailbreak_advanced is not None:
                                     new_out = jailbreak_advanced.gradient_steer(new_out, coeff, direction, out.dtype)
                                 elif use_advanced:
@@ -487,6 +565,19 @@ class NnsightAdapter(ModelAdapter):
                             new_out = jailbreak_advanced.mlp_direction_ablate(new_out, _mlp_dir, out.dtype)
                         if use_help and _help_dir is not None and jailbreak_advanced is not None and jailbreak_mode != "caa_dynamic":
                             new_out = jailbreak_advanced.helpfulness_boost(new_out, _help_dir, out.dtype)
+                        if (
+                            use_div
+                            and steering_config.diversion_residual_enabled()
+                            and _help_dir is not None
+                            and jailbreak_advanced is not None
+                        ):
+                            new_out = jailbreak_advanced.diversion_suppress(new_out, _help_dir, out.dtype)
+                        # Scale the whole edit by this layer's share of the
+                        # refusal signal, on the accumulated delta so it applies
+                        # uniformly to modes that renormalise internally.
+                        if layer_scale < 1.0:
+                            _base = original_out.float()
+                            new_out = (_base + (new_out.float() - _base) * layer_scale).to(out.dtype)
                         if use_norm and jailbreak_advanced is not None:
                             new_out = jailbreak_advanced.norm_regulate(new_out, original_out, out.dtype, hidden_dim=_hidden_dim)
                     if new_out is not out:
@@ -600,8 +691,8 @@ class NnsightAdapter(ModelAdapter):
         torch = self._torch
         lm = self._lm
         layers = self._layers
-        n_heads, head_dim = self._n_heads, self._head_dim
-        if not n_heads or not head_dim:
+        n_heads, head_dims = self._n_heads, self._head_dims
+        if not n_heads or not any(head_dims):
             return None
 
         captured: list[Any] = []
@@ -615,6 +706,10 @@ class NnsightAdapter(ModelAdapter):
             for i in range(len(layers)):
                 x = captured[i]  # keep model dtype so the (possibly quantized) o_proj accepts it
                 hidden = int(x.shape[0])
+                # Head width is per-layer: Gemma 4 alternates 256-wide sliding
+                # layers with 512-wide full-attention ones over the same
+                # 3840-wide residual.
+                head_dim = head_dims[i] or (hidden // n_heads)
                 o_proj = layers[i].self_attn.o_proj._module
                 device, dtype = x.device, x.dtype
                 # one masked input per head: row h carries only head h's slice of x
@@ -734,8 +829,14 @@ class NnsightAdapter(ModelAdapter):
         # For multimodal models the text config is nested under text_config.
         cfg = getattr(lm.config, "text_config", None) or lm.config
         self._n_heads = int(getattr(cfg, "num_attention_heads", 0) or 0)
-        hidden = int(getattr(cfg, "hidden_size", 0) or 0)
-        self._head_dim = (hidden // self._n_heads) if self._n_heads else 0
+        self._hidden_size = int(getattr(cfg, "hidden_size", 0) or 0)
+        # nnsight wraps every module in an envoy; unwrap to read in_features.
+        self._head_dims = _head_dims_per_layer(
+            self._layers,
+            self._n_heads,
+            self._hidden_size,
+            resolve=lambda module: getattr(module, "_module", module),
+        )
         self._loaded_model_id = key
 
     def _release_model(self, torch: Any) -> None:
@@ -751,6 +852,7 @@ class NnsightAdapter(ModelAdapter):
         self._lm = None
         self._tokenizer = None
         self._layers = []
+        self._head_dims = []
         self._embed_tokens_envoy = None
         self._final_norm = None
         self._lm_head_weight = None
@@ -807,6 +909,8 @@ class NnsightAdapter(ModelAdapter):
         prompt: str,
         language: str = "en",
         history: list[tuple[str, str]] | None = None,
+        system_prompt: str | None = None,
+        assistant_prefill: str | None = None,
     ) -> str:
         """Render a chat-template prompt from prior turns + the new user message.
 
@@ -818,17 +922,22 @@ class NnsightAdapter(ModelAdapter):
         tokenizer = self._tokenizer
 
         messages: list[dict[str, str]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
         for role, content in history or []:
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": prompt})
+        if assistant_prefill:
+            messages.append({"role": "assistant", "content": assistant_prefill})
 
         if hasattr(tokenizer, "apply_chat_template"):
             try:
                 return tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
-                    add_generation_prompt=True,
+                    add_generation_prompt=not bool(assistant_prefill),
+                    continue_final_message=bool(assistant_prefill),
                 )
             except Exception:
                 pass
@@ -836,7 +945,8 @@ class NnsightAdapter(ModelAdapter):
         rendered = []
         for msg in messages:
             rendered.append(f"{msg['role'].capitalize()}: {msg['content']}")
-        rendered.append("Assistant:")
+        if not assistant_prefill:
+            rendered.append("Assistant:")
         return "\n\n".join(rendered)
 
     def _real_prompt_tokens(self, prompt_token_ids: list[int]) -> tuple[list[str], list[int]]:

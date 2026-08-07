@@ -7,6 +7,7 @@ import re
 from collections.abc import AsyncIterator
 from typing import Any
 
+from app import refusal, run_control, token_budget
 from app.adapters.base import ModelAdapter, event, hallucination_from_entropy
 from app.schemas import RunRequest
 
@@ -42,6 +43,17 @@ class MockAdapter(ModelAdapter):
         layer_count = 28
         head_count = 12
         interventions = request.active_interventions()
+        context_length = 4096
+        effective_max_tokens = token_budget.effective_output_tokens(
+            request.max_new_tokens, request.token_limit_mode, len(prompt_tokens), context_length
+        )
+        resolved_budget = token_budget.budget_payload(
+            requested=request.max_new_tokens,
+            effective=effective_max_tokens,
+            mode=request.token_limit_mode,
+            context_length=context_length,
+            prompt_tokens=len(prompt_tokens),
+        )
 
         yield event(
             "run_started",
@@ -50,7 +62,7 @@ class MockAdapter(ModelAdapter):
                 "model": request.model or "mock-qwen2.5-1.5b",
                 "layer_count": layer_count,
                 "head_count": head_count,
-                "prompt_tokens": len(prompt_tokens),
+                **resolved_budget,
                 "output_policy": request.output_policy,
             },
         )
@@ -75,12 +87,15 @@ class MockAdapter(ModelAdapter):
             )
 
         output = _mock_output(profile, request.output_policy, bool(interventions))
-        generated = ""
-        for index, token in enumerate(output[: request.max_new_tokens]):
+        generated = request.assistant_prefill or ""
+        emitted = 0
+        for index, token in enumerate(output[:effective_max_tokens]):
+            if run_control.cancelled():
+                break
             layer_activity = _layer_activity(layer_count, profile, index, interventions, rng)
             entropy = _entropy(profile, index, bool(interventions), rng)
             safety = _safety_state(profile, index, interventions)
-            concepts = _concept_trace(profile, index, rng)
+            concepts = _concept_trace(profile, index, rng, layer_count)
 
             yield event("layer_activity", {"layers": layer_activity})
             yield event(
@@ -101,9 +116,10 @@ class MockAdapter(ModelAdapter):
                     "top_k": _top_k_candidates(token, entropy, rng),
                 },
             )
-            yield event("concept_trace", {"concepts": concepts})
+            yield event("concept_trace", concepts)
 
             generated += token
+            emitted += 1
             yield event(
                 "token",
                 {
@@ -116,12 +132,26 @@ class MockAdapter(ModelAdapter):
             )
             await asyncio.sleep(0.08)
 
+        finish_reason = "cancelled" if run_control.cancelled() else "length" if len(output) > effective_max_tokens else "stop"
+        outcome = refusal.classify_output(generated, request.response_language)
+        assessment = refusal.assess_output(
+            generated,
+            request.response_language,
+            finish_reason=finish_reason,
+            output_tokens=emitted,
+            max_new_tokens=effective_max_tokens,
+        )
         yield event(
             "run_completed",
             {
                 "generated_text": generated,
-                "finish_reason": "length" if len(output) > request.max_new_tokens else "stop",
-                "output_tokens": min(len(output), request.max_new_tokens),
+                "finish_reason": finish_reason,
+                "output_tokens": emitted,
+                "refused": outcome == "refusal",
+                "outcome": outcome,
+                "coherent": assessment["coherent"],
+                "assessment": assessment,
+                **resolved_budget,
             },
         )
 
@@ -271,18 +301,42 @@ def _entropy(profile: str, step: int, intervened: bool, rng: random.Random) -> f
     return round(max(base, 0.15), 3)
 
 
-def _concept_trace(profile: str, step: int, rng: random.Random) -> list[dict[str, Any]]:
-    concepts_by_profile = {
-        "flower": ["plant", "color", "petals", "scent", "growth", "metaphor"],
-        "safety": ["risk", "policy", "refusal", "procedure", "intent", "harm"],
-        "hallucination": ["uncertainty", "missing context", "guessing", "low evidence", "fabrication"],
-        "general": ["topic", "context", "instruction", "response plan", "tone"],
-    }
-    concepts = concepts_by_profile[profile]
-    return [
-        {"name": name, "score": round(_clamp(0.25 + rng.random() * 0.55 + (step % 5) * 0.025), 3)}
-        for name in concepts
-    ]
+# The mock exists to exercise the real UI contract, so it emits the same
+# {names, layers, concepts} payload the white-box adapters do — including the
+# mid-band peak, so the panel looks like a real run instead of noise.
+MOCK_CONCEPTS = ["code", "math", "emotion", "nature", "history", "person", "place", "refusal"]
+
+# Which concept a mock profile leans on, so the panel tells a coherent story.
+_PROFILE_LEAD = {"flower": "nature", "safety": "refusal", "hallucination": "person", "general": "code"}
+
+
+def _concept_trace(profile: str, step: int, rng: random.Random, layer_count: int) -> dict[str, Any]:
+    lead = _PROFILE_LEAD.get(profile, "code")
+    lo, hi = max(int(layer_count * 0.4), 1), max(int(layer_count * 0.85), 2)
+    mid = (lo + hi) / 2
+    spread = max((hi - lo) / 2, 1.0)
+
+    layers: list[list[float]] = []
+    for layer in range(layer_count):
+        # Bell curve around the mid band: strong for the lead concept, weak noise
+        # for the rest — the shape a real one-vs-rest projection produces.
+        falloff = max(0.0, 1.0 - ((layer - mid) / spread) ** 2)
+        row = []
+        for name in MOCK_CONCEPTS:
+            base = falloff if name == lead else falloff * 0.25
+            row.append(round(_clamp(base * (0.8 + rng.random() * 0.3) + (step % 5) * 0.01), 3))
+        layers.append(row)
+
+    ranked = []
+    for index, name in enumerate(MOCK_CONCEPTS):
+        best_layer, best = lo, 0.0
+        for layer in range(lo, min(hi + 1, layer_count)):
+            if layers[layer][index] > best:
+                best, best_layer = layers[layer][index], layer
+        ranked.append({"name": name, "score": round(best, 3), "layer": best_layer})
+    ranked.sort(key=lambda item: item["score"], reverse=True)
+
+    return {"names": MOCK_CONCEPTS, "layers": layers, "concepts": ranked}
 
 
 def _intervention_payload(intervention: Any) -> dict[str, Any]:
