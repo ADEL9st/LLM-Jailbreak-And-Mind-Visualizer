@@ -23,7 +23,7 @@ VENV = ROOT / "backend" / ".venv"
 
 
 def _run(command: list[str], *, cwd: Path | None = None, optional: bool = False) -> bool:
-    print("+", " ".join(command))
+    print("+", " ".join(command), flush=True)
     try:
         subprocess.run(command, cwd=cwd, check=True)
         return True
@@ -56,8 +56,19 @@ def _has_nvidia() -> bool:
         return False
 
 
-def _imports_work(python: Path, *modules: str) -> bool:
-    probe = "import " + ", ".join(modules)
+def _modules_available(python: Path, *modules: str) -> bool:
+    """Check module availability without importing heavy ML libraries.
+
+    Importing torch, transformers, and nnsight on every launch can take more
+    than ten seconds even when everything is already installed.  The actual
+    server still imports them when a local model is selected; setup only needs
+    to know whether the packages are present.
+    """
+    names = repr(list(modules))
+    probe = (
+        "import importlib.util, sys; "
+        f"sys.exit(0 if all(importlib.util.find_spec(n) is not None for n in {names}) else 1)"
+    )
     return subprocess.run(
         [str(python), "-c", probe],
         stdout=subprocess.DEVNULL,
@@ -81,7 +92,7 @@ def _install_ml(python: Path, gpu: bool) -> None:
         print("NVIDIA GPU detected; installing the standard PyTorch wheel set.")
         _run([str(python), "-m", "pip", "install", "-r", str(requirements)])
     else:
-        print("No NVIDIA GPU detected; installing CPU-only PyTorch wheels.")
+        print("No NVIDIA GPU detected; installing CPU-only PyTorch wheels.", flush=True)
         _run(
             [
                 str(python),
@@ -104,30 +115,35 @@ def prepare(*, skip_ml: bool = False, skip_nnsight: bool = False) -> None:
     VENV.parent.mkdir(parents=True, exist_ok=True)
     python = _venv_python()
     if not python.exists():
-        print("Creating backend virtual environment...")
+        print("Creating backend virtual environment...", flush=True)
         _run([sys.executable, "-m", "venv", str(VENV)])
 
     # Do not upgrade or replace a working environment on every launch.  This
     # is deliberately a compatibility check, not a blanket reinstall.
-    if not _imports_work(python, "fastapi", "uvicorn", "pydantic"):
-        print("Installing backend dependencies...")
+    print("Checking backend packages...", flush=True)
+    if not _modules_available(python, "fastapi", "uvicorn", "pydantic"):
+        print("Installing backend dependencies...", flush=True)
         _run([str(python), "-m", "pip", "install", "-r", str(ROOT / "backend" / "requirements.txt")])
     else:
-        print("Existing backend packages are compatible; keeping them.")
+        print("Existing backend packages are compatible; keeping them.", flush=True)
 
-    if not skip_ml and not _imports_work(python, "torch", "transformers"):
-        _install_ml(python, gpu=_has_nvidia())
+    gpu = _has_nvidia()
+    if not skip_ml:
+        print("Checking local-model packages...", flush=True)
+    if not skip_ml and not _modules_available(python, "torch", "transformers"):
+        _install_ml(python, gpu=gpu)
     elif not skip_ml:
-        print("Existing ML packages are compatible; keeping them.")
+        print("Existing ML packages are compatible; keeping them.", flush=True)
 
-    if not skip_nnsight and not _imports_work(python, "nnsight"):
+    if not skip_nnsight and not _modules_available(python, "nnsight"):
+        print("Installing the optional nnsight adapter...", flush=True)
         _run(
             [str(python), "-m", "pip", "install", "-r", str(ROOT / "backend" / "requirements-nnsight.txt")],
             optional=True,
         )
 
     (ROOT / "models").mkdir(exist_ok=True)
-    print(f"Ready on {platform.system()} ({'NVIDIA GPU' if _has_nvidia() else 'CPU'} profile).")
+    print(f"Ready on {platform.system()} ({'NVIDIA GPU' if gpu else 'CPU'} profile).", flush=True)
 
 
 def main() -> None:
